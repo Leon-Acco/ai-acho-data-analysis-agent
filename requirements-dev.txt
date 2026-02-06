@@ -1,0 +1,21 @@
+# Development dependencies for AI Data Analysis Agent
+-r requirements.txt
+
+# Development tools
+black>=24.0.0
+isort>=5.13.0
+flake8>=7.0.0
+mypy>=1.8.0
+pytest>=8.0.0
+pytest-cov>=4.1.0
+
+# Type stubs for better type checking
+types-python-dateutil
+types-requests
+
+# Documentation
+mkdocs>=1.5.0
+mkdocs-material>=9.5.0
+
+# Testing data generation
+faker>=20.0.0

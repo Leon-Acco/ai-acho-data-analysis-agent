@@ -1,0 +1,11 @@
+﻿# Python
+.venv/
+__pycache__/
+*.pyc
+# Streamlit
+.streamlit/
+# Data uploads
+data_uploads/
+# OS
+.DS_Store
+Thumbs.db

@@ -18,11 +18,18 @@ from agent_enhanced import (
     validate_sql,
 )
 from duckdb_manager import DuckDBManager, create_in_memory_db
+from model_config import (
+    AVAILABLE_MODELS,
+    get_model_config,
+    get_model_env_var,
+    get_default_model,
+    ModelProvider,
+)
 
 load_dotenv()
 
-APP_TITLE = "AI数据分析助手 (Agno + DeepSeek + DuckDB)"
-APP_DESCRIPTION = "上传CSV/Excel文件并使用自然语言提问。通过AI生成SQL实现即时数据分析。"
+APP_TITLE = "AI数据分析助手 (Agno + 多模型 + DuckDB)"
+APP_DESCRIPTION = "支持多模型的数据分析工具 | DeepSeek、智谱、豆包、千问、OpenAI"
 
 
 def init_session_state() -> None:
@@ -40,6 +47,12 @@ def init_session_state() -> None:
     
     if "show_advanced" not in st.session_state:
         st.session_state.show_advanced = False
+    
+    if "selected_model" not in st.session_state:
+        st.session_state.selected_model = get_default_model()
+    
+    if "api_keys_configured" not in st.session_state:
+        st.session_state.api_keys_configured = {}
 
 
 def reset_session() -> None:
@@ -51,18 +64,76 @@ def reset_session() -> None:
     st.rerun()
 
 
-def render_sidebar() -> None:
+def get_api_key_from_env(model_key: str) -> str:
+    """从环境变量获取指定模型的API密钥"""
+    model_config = get_model_config(model_key)
+    if model_config is None:
+        return ""
+    
+    env_var = get_model_env_var(model_config.provider)
+    return os.getenv(env_var, "")
+
+
+def render_sidebar() -> dict:
+    """渲染侧边栏设置
+    
+    Returns:
+        dict: 包含 api_key, model_key, row_limit 等配置
+    """
+    config = {}
+    
     with st.sidebar:
         st.title("⚙️ 设置")
         
-        api_key = st.text_input(
-            "DeepSeek API密钥",
-            value=os.getenv("DEEPSEEK_API_KEY", ""),
-            type="password",
-            help="从 https://platform.deepseek.com/ 获取您的API密钥"
+        st.subheader("🤖 模型选择")
+        
+        model_options = {
+            config.display_name: key for key, config in AVAILABLE_MODELS.items()
+        }
+        
+        default_model = st.session_state.get("selected_model", get_default_model())
+        default_index = list(model_options.values()).index(default_model) if default_model in model_options.values() else 0
+        
+        selected_display = st.selectbox(
+            "选择模型",
+            options=list(model_options.keys()),
+            index=default_index,
+            help="选择要使用的AI模型"
         )
         
-        st.session_state.api_key = api_key
+        model_key = model_options.get(selected_display, get_default_model())
+        st.session_state.selected_model = model_key
+        config["model_key"] = model_key
+        
+        model_config = get_model_config(model_key)
+        provider_name = model_config.provider.value.upper() if model_config else "UNKNOWN"
+        st.caption(f"📡 提供商: {provider_name} | 🎯 模型: {model_config.model_name if model_config else 'unknown'}")
+        
+        st.divider()
+        
+        st.subheader("🔑 API密钥配置")
+        
+        env_api_key = get_api_key_from_env(model_key)
+        
+        page_api_key = st.text_input(
+            f"{selected_display} API密钥",
+            value=env_api_key,
+            type="password",
+            key=f"api_key_{model_key}",
+            help=f"请输入 {selected_display} 的API密钥，支持环境变量配置"
+        )
+        
+        if not page_api_key and env_api_key:
+            api_key = env_api_key
+            st.success("✅ 已从环境变量加载API密钥")
+        elif page_api_key:
+            api_key = page_api_key
+            st.success("✅ 已配置API密钥")
+        else:
+            api_key = ""
+            st.warning("⚠️ 请配置API密钥以使用AI功能")
+        
+        config["api_key"] = api_key
         
         st.divider()
         
@@ -75,14 +146,14 @@ def render_sidebar() -> None:
             step=10,
             help="查询返回的最大行数"
         )
-        st.session_state.row_limit = row_limit
+        config["row_limit"] = row_limit
         
         enable_explanations = st.checkbox(
             "显示SQL解释",
             value=False,
             help="包含生成SQL的解释说明"
         )
-        st.session_state.enable_explanations = enable_explanations
+        config["enable_explanations"] = enable_explanations
         
         st.divider()
         
@@ -129,7 +200,9 @@ def render_sidebar() -> None:
                 st.session_state.show_export = True
         
         st.divider()
-        st.caption("使用 Agno、DeepSeek & DuckDB 构建")
+        st.caption("🤗 使用 Agno、多模型 & DuckDB 构建")
+    
+    return config
 
 
 def render_file_upload() -> None:
@@ -321,23 +394,38 @@ def render_query_interface() -> None:
                     st.session_state.current_query = example
                     st.rerun()
     
-    if st.session_state.current_query and st.session_state.api_key:
+    if st.session_state.current_query:
         process_query(st.session_state.current_query)
 
 
 def process_query(question: str) -> None:
-    with st.spinner("🤖 生成SQL查询..."):
+    config = st.session_state.get("sidebar_config", {})
+    api_key = config.get("api_key", "")
+    model_key = config.get("model_key", get_default_model())
+    enable_explanations = config.get("enable_explanations", False)
+    
+    if not api_key:
+        st.error("请在侧边栏配置API密钥以使用AI功能")
+        return
+    
+    model_config = get_model_config(model_key)
+    if not model_config:
+        st.error(f"未知的模型配置: {model_key}")
+        return
+    
+    with st.spinner(f"🤖 正在使用 {model_config.display_name} 生成SQL查询..."):
         tables = get_table_info_with_samples(st.session_state.db_manager.connection)
         schema_context = render_schema_context(tables, include_samples=True)
         
         agent = build_advanced_agent(
-            api_key=st.session_state.api_key,
+            api_key=api_key,
             schema_context=schema_context,
-            enable_explanations=st.session_state.enable_explanations
+            model_key=model_key,
+            enable_explanations=enable_explanations
         )
         
         response = agent.run(question)
-        sql = extract_sql_from_response(response, st.session_state.enable_explanations)
+        sql = extract_sql_from_response(response, enable_explanations)
     
     if not sql:
         st.error("AI代理未生成有效的SQL。请尝试重新表述您的问题。")
@@ -345,6 +433,9 @@ def process_query(question: str) -> None:
     
     st.subheader("📄 生成的SQL")
     st.code(sql, language="sql")
+    
+    if model_config:
+        st.caption(f"🤖 模型: {model_config.display_name} | 提供商: {model_config.provider.value.upper()}")
     
     with st.spinner("🔍 验证并执行查询..."):
         is_valid, validation_msg = validate_sql(sql, st.session_state.db_manager.connection)
@@ -356,12 +447,12 @@ def process_query(question: str) -> None:
         st.success(f"✅ SQL验证通过: {validation_msg}")
         
         if "limit" not in sql.lower():
-            sql = f"{sql.rstrip(';')} LIMIT {st.session_state.row_limit}"
+            sql = f"{sql.rstrip(';')} LIMIT {config.get('row_limit', 200)}"
         
         result = st.session_state.db_manager.execute_query(sql)
     
     if result.success:
-        display_query_results(result, question, sql)
+        display_query_results(result, question, sql, model_config)
     else:
         st.error(f"查询执行失败: {result.error}")
         
@@ -373,7 +464,7 @@ def process_query(question: str) -> None:
             st.text(str(response)[:500] + "..." if len(str(response)) > 500 else str(response))
 
 
-def display_query_results(result, question: str, sql: str) -> None:
+def display_query_results(result, question: str, sql: str, model_config=None) -> None:
     df = result.data
     
     st.subheader("📊 结果")
@@ -471,16 +562,40 @@ def display_query_results(result, question: str, sql: str) -> None:
                         )
                 
                 if viz_type == "折线图" and x_col and y_col:
-                    chart_data = df[[x_col, y_col]].set_index(x_col)
-                    st.line_chart(chart_data)
+                    try:
+                        chart_data = df[[x_col, y_col]].set_index(x_col)
+                        if chart_data.index.nlevels > 1:
+                            st.warning("X轴包含多级索引，使用原始数据绘图")
+                            chart_data = df[[x_col, y_col]]
+                        st.line_chart(chart_data)
+                    except Exception as e:
+                        st.warning(f"无法创建折线图: {str(e)}")
+                        st.bar_chart(df[y_col])
                 elif viz_type == "柱状图" and x_col and y_col:
-                    chart_data = df[[x_col, y_col]].set_index(x_col)
-                    st.bar_chart(chart_data)
+                    try:
+                        chart_data = df[[x_col, y_col]].set_index(x_col)
+                        if chart_data.index.nlevels > 1:
+                            st.warning("X轴包含多级索引，使用原始数据绘图")
+                            chart_data = df[[x_col, y_col]]
+                        st.bar_chart(chart_data)
+                    except Exception as e:
+                        st.warning(f"无法创建柱状图: {str(e)}")
+                        st.bar_chart(df[y_col])
                 elif viz_type == "散点图" and x_col and y_col:
-                    st.scatter_chart(df, x=x_col, y=y_col)
+                    try:
+                        st.scatter_chart(df, x=x_col, y=y_col)
+                    except Exception as e:
+                        st.warning(f"无法创建散点图: {str(e)}")
                 elif viz_type == "面积图" and x_col and y_col:
-                    chart_data = df[[x_col, y_col]].set_index(x_col)
-                    st.area_chart(chart_data)
+                    try:
+                        chart_data = df[[x_col, y_col]].set_index(x_col)
+                        if chart_data.index.nlevels > 1:
+                            st.warning("X轴包含多级索引，使用原始数据绘图")
+                            chart_data = df[[x_col, y_col]]
+                        st.area_chart(chart_data)
+                    except Exception as e:
+                        st.warning(f"无法创建面积图: {str(e)}")
+                        st.bar_chart(df[y_col])
                 elif viz_type == "直方图" and y_col:
                     st.bar_chart(df[y_col].value_counts().sort_index())
                 elif viz_type == "箱线图" and y_col:
@@ -511,103 +626,75 @@ def display_query_results(result, question: str, sql: str) -> None:
         export_filename = st.text_input(
             "文件名",
             value=f"analysis_export_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}",
-            help="导出文件的名称（不含扩展名）"
+            help="导出的文件名（不含扩展名）"
         )
         
-        if st.button("📥 导出数据", type="primary"):
-            with tempfile.TemporaryDirectory() as tmpdir:
-                tmp_path = Path(tmpdir) / f"{export_filename}.{export_format.lower()}"
+        if st.button("💾 开始导出", use_container_width=True):
+            try:
+                if export_format == "CSV":
+                    csv = df.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        label="📥 下载 CSV",
+                        data=csv,
+                        file_name=f"{export_filename}.csv",
+                        mime="text/csv"
+                    )
+                elif export_format == "Excel":
+                    excel_buffer = pd.ExcelWriter(
+                        pd.io.excel.ExcelWriter(
+                            pd.io.common.BytesIO(),
+                            engine="openpyxl"
+                        ),
+                        engine="openpyxl"
+                    )
+                    df.to_excel(excel_buffer, index=False, sheet_name="Analysis Results")
+                    excel_buffer.close()
+                    excel_data = excel_buffer.book.book.getvalue()
+                    st.download_button(
+                        label="📥 下载 Excel",
+                        data=excel_data,
+                        file_name=f"{export_filename}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                elif export_format == "JSON":
+                    json_data = df.to_json(orient="records", force_ascii=False).encode("utf-8")
+                    st.download_button(
+                        label="📥 下载 JSON",
+                        data=json_data,
+                        file_name=f"{export_filename}.json",
+                        mime="application/json"
+                    )
+                elif export_format == "Parquet":
+                    parquet_buffer = df.to_parquet()
+                    st.download_button(
+                        label="📥 下载 Parquet",
+                        data=parquet_buffer,
+                        file_name=f"{export_filename}.parquet",
+                        mime="application/octet-stream"
+                    )
                 
-                try:
-                    if export_format == "CSV":
-                        df.to_csv(tmp_path, index=False)
-                    elif export_format == "Excel":
-                        df.to_excel(tmp_path, index=False)
-                    elif export_format == "JSON":
-                        df.to_json(tmp_path, orient="records", indent=2)
-                    elif export_format == "Parquet":
-                        df.to_parquet(tmp_path, index=False)
-                    
-                    with open(tmp_path, "rb") as f:
-                        st.download_button(
-                            label=f"下载 {export_format} 文件",
-                            data=f,
-                            file_name=f"{export_filename}.{export_format.lower()}",
-                            mime={
-                                "CSV": "text/csv",
-                                "Excel": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                "JSON": "application/json",
-                                "Parquet": "application/octet-stream"
-                            }[export_format]
-                        )
-                    
-                    st.success(f"数据已成功导出为 {export_format} 格式")
-                except Exception as e:
-                    st.error(f"导出失败: {str(e)}")
-        
-        st.divider()
-        
-        st.subheader("保存分析到历史记录")
-        if st.button("💾 保存到历史记录"):
-            analysis_entry = {
-                "timestamp": pd.Timestamp.now().isoformat(),
-                "question": question,
-                "sql": sql,
-                "row_count": len(df),
-                "execution_time": result.execution_time_ms,
-                "columns": list(df.columns)
-            }
-            
-            st.session_state.analysis_history.append(analysis_entry)
-            st.success("分析已保存到历史记录！")
-    
-    st.session_state.analysis_history.append({
-        "timestamp": pd.Timestamp.now().isoformat(),
-        "question": question,
-        "sql": sql,
-        "row_count": len(df),
-        "execution_time": result.execution_time_ms
-    })
-
-
-def render_history() -> None:
-    if not st.session_state.analysis_history:
-        return
-    
-    st.header("📜 分析历史")
-    
-    for i, entry in enumerate(reversed(st.session_state.analysis_history[-10:])):
-        with st.expander(f"查询 {len(st.session_state.analysis_history) - i}: {entry['question'][:50]}..."):
-            st.write(f"**时间:** {entry['timestamp']}")
-            st.write(f"**问题:** {entry['question']}")
-            st.code(entry['sql'], language="sql")
-            st.write(f"**结果:** {entry.get('row_count', 0)} 行, {entry.get('execution_time', 0):.1f} 毫秒")
-            
-            if st.button(f"重新运行查询", key=f"rerun_{i}"):
-                st.session_state.current_query = entry['question']
-                st.rerun()
+                st.success(f"✅ 已准备 {export_format} 格式导出")
+            except Exception as e:
+                st.error(f"导出失败: {str(e)}")
 
 
 def main() -> None:
     st.set_page_config(
         page_title=APP_TITLE,
-        page_icon="📊",
         layout="wide",
-        initial_sidebar_state="expanded"
+        page_icon="📊"
     )
     
-    st.title(APP_TITLE)
-    st.markdown(APP_DESCRIPTION)
+    st.title(f"📊 {APP_TITLE}")
+    st.caption(APP_DESCRIPTION)
     
     init_session_state()
-    render_sidebar()
+    
+    config = render_sidebar()
+    st.session_state.sidebar_config = config
     
     render_file_upload()
     render_query_interface()
-    render_history()
-    
-    st.divider()
-    st.caption("✨ 由 [Agno](https://github.com/agno-agi/agno)、[DeepSeek](https://platform.deepseek.com/)、[DuckDB](https://duckdb.org/) 和 [Streamlit](https://streamlit.io/) 提供支持")
 
 
 if __name__ == "__main__":

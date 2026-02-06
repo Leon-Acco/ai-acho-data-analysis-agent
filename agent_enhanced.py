@@ -8,6 +8,12 @@ from typing import Any, Iterable
 import duckdb
 from openai import OpenAI
 
+from model_config import (
+    get_model_config,
+    ModelProvider,
+    AVAILABLE_MODELS,
+)
+
 
 @dataclass
 class TableInfo:
@@ -63,10 +69,32 @@ def render_schema_context(tables: Iterable[TableInfo], include_samples: bool = T
     return "\n".join(lines).strip()
 
 
-def build_advanced_agent(api_key: str, schema_context: str, enable_explanations: bool = False):
+def build_advanced_agent(
+    api_key: str,
+    schema_context: str,
+    model_key: str = "deepseek-chat",
+    enable_explanations: bool = False,
+):
+    """
+    构建增强版AI Agent
+
+    Args:
+        api_key: API密钥
+        schema_context: 数据库Schema上下文
+        model_key: 模型标识符
+        enable_explanations: 是否允许返回解释性内容
+
+    Returns:
+        Agent实例
+    """
+    model_config = get_model_config(model_key)
+    
+    if model_config is None:
+        raise ValueError(f"未知的模型: {model_key}，可选模型: {list(AVAILABLE_MODELS.keys())}")
+    
     client = OpenAI(
         api_key=api_key,
-        base_url="https://api.deepseek.com"
+        base_url=model_config.api_base,
     )
     
     instructions = [
@@ -94,10 +122,11 @@ Important Notes:
 """
     
     class SimpleAgent:
-        def __init__(self, client, instructions, context, enable_explanations):
+        def __init__(self, client, instructions, context, model_config, enable_explanations):
             self.client = client
             self.instructions = instructions
             self.context = context
+            self.model_config = model_config
             self.enable_explanations = enable_explanations
         
         def run(self, question: str):
@@ -106,7 +135,7 @@ Important Notes:
             
             try:
                 response = self.client.chat.completions.create(
-                    model="deepseek-chat",
+                    model=self.model_config.model_name,
                     messages=[
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": full_context},
@@ -117,18 +146,19 @@ Important Notes:
                 )
                 return response.choices[0].message.content
             except Exception as e:
-                return f"Error calling DeepSeek API: {str(e)}"
+                return f"Error calling {self.model_config.display_name} API: {str(e)}"
     
     return SimpleAgent(
         client=client,
         instructions=instructions,
         context=context,
+        model_config=model_config,
         enable_explanations=enable_explanations
     )
 
 
 def validate_sql(sql: str, connection: duckdb.DuckDBPyConnection) -> tuple[bool, str]:
-    """Validate SQL syntax and check for potential issues."""
+    """验证SQL语法并检查潜在问题"""
     if not sql:
         return False, "Empty SQL"
     
@@ -157,7 +187,7 @@ def validate_sql(sql: str, connection: duckdb.DuckDBPyConnection) -> tuple[bool,
 
 
 def extract_sql_from_response(response, allow_explanations: bool = False) -> str:
-    """Extract SQL from agent response, handling various response formats."""
+    """从Agent响应中提取SQL"""
     if response is None:
         return ""
     
@@ -182,7 +212,7 @@ def extract_sql_from_response(response, allow_explanations: bool = False) -> str
 
 
 def generate_analysis_summary(df) -> dict[str, Any]:
-    """Generate a comprehensive summary of the query results."""
+    """生成查询结果的综合摘要"""
     if df.empty:
         return {"message": "Query returned no results"}
     
@@ -220,7 +250,7 @@ def generate_analysis_summary(df) -> dict[str, Any]:
 
 
 def suggest_visualizations(df) -> list[str]:
-    """Suggest appropriate visualizations based on data characteristics."""
+    """根据数据特征推荐合适的可视化方式"""
     suggestions = []
     
     if df.empty:

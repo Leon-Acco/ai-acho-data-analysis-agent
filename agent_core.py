@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Iterable
@@ -6,6 +6,12 @@ import os
 
 import duckdb
 from openai import OpenAI
+
+from model_config import (
+    get_model_config,
+    ModelProvider,
+    AVAILABLE_MODELS,
+)
 
 
 @dataclass
@@ -36,10 +42,30 @@ def render_schema_context(tables: Iterable[TableInfo]) -> str:
     return "\n".join(lines).strip()
 
 
-def build_agent(api_key: str, schema_context: str):
+def build_agent(
+    api_key: str,
+    schema_context: str,
+    model_key: str = "deepseek-chat",
+):
+    """
+    构建AI Agent
+
+    Args:
+        api_key: API密钥
+        schema_context: 数据库Schema上下文
+        model_key: 模型标识符，对应model_config.AVAAILABLE_MODELS中的键
+
+    Returns:
+        Agent实例
+    """
+    model_config = get_model_config(model_key)
+    
+    if model_config is None:
+        raise ValueError(f"未知的模型: {model_key}，可选模型: {list(AVAILABLE_MODELS.keys())}")
+    
     client = OpenAI(
         api_key=api_key,
-        base_url="https://api.deepseek.com"
+        base_url=model_config.api_base,
     )
     
     instructions = [
@@ -50,10 +76,11 @@ def build_agent(api_key: str, schema_context: str):
     ]
     
     class SimpleAgent:
-        def __init__(self, client, instructions, context):
+        def __init__(self, client, instructions, context, model_config):
             self.client = client
             self.instructions = instructions
             self.context = context
+            self.model_config = model_config
         
         def run(self, question: str):
             system_prompt = "\n".join(self.instructions)
@@ -61,7 +88,7 @@ def build_agent(api_key: str, schema_context: str):
             
             try:
                 response = self.client.chat.completions.create(
-                    model="deepseek-chat",
+                    model=self.model_config.model_name,
                     messages=[
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": full_context},
@@ -71,16 +98,18 @@ def build_agent(api_key: str, schema_context: str):
                 )
                 return response.choices[0].message.content
             except Exception as e:
-                return f"Error calling DeepSeek API: {str(e)}"
+                return f"Error calling {self.model_config.display_name} API: {str(e)}"
     
     return SimpleAgent(
         client=client,
         instructions=instructions,
-        context=f"Schema context:\n{schema_context}"
+        context=f"Schema context:\n{schema_context}",
+        model_config=model_config,
     )
 
 
 def extract_sql(response) -> str:
+    """从Agent响应中提取SQL"""
     if response is None:
         return ""
     if isinstance(response, str):

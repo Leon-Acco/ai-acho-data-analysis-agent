@@ -63,8 +63,8 @@
 #### 1️⃣ 克隆项目并创建虚拟环境
 
 ```bash
-git clone https://github.com/yourusername/ai-data-analysis-agent.git
-cd ai-data-analysis-agent
+git clone https://github.com/Leon-Acco/ai-acho-data-analysis-agent
+cd ai-acho-data-analysis-agent
 
 python -m venv .venv
 
